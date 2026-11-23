@@ -165,23 +165,23 @@ function trimST(s) {
 
 function isSpaceTab(c) { return c === 32 || c === 9; }
 
+// Whitespace lookup table: WS[c] === 1 iff c is a whitespace code unit
+// (same set as the reference's isWhitespace). One array lookup replaces
+// ~10 comparisons per character in the hot word-count loop.
+const WS = new Uint8Array(65536);
+for (const _c of [9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279]) WS[_c] = 1;
+
 function isWhitespaceCode(c) {
-  return c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 ||
-    c === 160 || c === 5760 || (c >= 8192 && c <= 8202) || c === 8232 ||
-    c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
+  return WS[c] === 1;
 }
 
-function countWords(lines) {
+function countWords(lines, start) {
   let words = 0;
-  for (let li = 0; li < lines.length; li++) {
+  for (let li = start; li < lines.length; li++) {
     const line = lines[li];
     let inWord = false;
     for (let i = 0; i < line.length; i++) {
-      const c = line.charCodeAt(i);
-      const ws = c === 32 || (c >= 9 && c <= 13) || c === 160 || c === 5760 ||
-        (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 ||
-        c === 8287 || c === 12288 || c === 65279;
-      if (ws) inWord = false;
+      if (WS[line.charCodeAt(i)]) inWord = false;
       else if (!inWord) { words++; inWord = true; }
     }
   }
@@ -537,6 +537,9 @@ function resolveLinkTarget(target) {
 
 // --- inline rendering -------------------------------------------------------
 
+// Next inline special char: backslash, backtick, star, open bracket.
+const SPECIAL_RE = /[\\`*[]/g;
+
 // Backslash-escapable characters: ` \ * _ [ ] ( ) # + - . ! >
 function isEscapable(c) {
   return c === 96 || c === 92 || c === 42 || c === 95 || c === 91 || c === 93 ||
@@ -607,17 +610,13 @@ function renderInline(s, a, b, out) {
   let plain = a;
   while (i < n) {
     // Jump to the next inline special char (\, `, *, [) at or after i.
-    let next = n;
-    let ci = s.indexOf('\\', i);
-    if (ci !== -1 && ci < next) next = ci;
-    ci = s.indexOf('`', i);
-    if (ci !== -1 && ci < next) next = ci;
-    ci = s.indexOf('*', i);
-    if (ci !== -1 && ci < next) next = ci;
-    ci = s.indexOf('[', i);
-    if (ci !== -1 && ci < next) next = ci;
-    if (next >= n) break;
-    i = next;
+    // One regex scan beats four indexOf scans (~3.3x in micro-bench).
+    // Safe under recursion: lastIndex is set explicitly before every exec,
+    // so a nested renderInline cannot corrupt the outer loop's position.
+    SPECIAL_RE.lastIndex = i;
+    const m = SPECIAL_RE.exec(s);
+    if (!m || m.index >= n) break;
+    i = m.index;
     const c = s.charCodeAt(i);
     if (c === 92) { // backslash
       if (i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
@@ -761,15 +760,15 @@ function parseListMarker(line) {
   return null;
 }
 
-function renderMarkdown(bodyLines) {
+function renderMarkdown(lines, start) {
   const out = [];
   const toc = [];
   let excerpt = null;
   const headingTaken = new Set();
-  const n = bodyLines.length;
-  let i = 0;
+  const n = lines.length;
+  let i = start;
   while (i < n) {
-    const line = bodyLines[i];
+    const line = lines[i];
     if (isBlankLine(line)) { i++; continue; }
     // Fence
     const lang = parseFenceOpen(line);
@@ -777,7 +776,7 @@ function renderMarkdown(bodyLines) {
       i++;
       out.push('<pre><code' + (lang !== '' ? ' class="language-' + lang + '"' : '') + '>');
       while (i < n) {
-        const l = bodyLines[i];
+        const l = lines[i];
         if (isFenceClose(l)) { i++; break; }
         pushEsc(out, l, 0, l.length);
         out.push('\n');
@@ -801,8 +800,8 @@ function renderMarkdown(bodyLines) {
     // Blockquote
     if (line.charCodeAt(0) === 62) {
       const parts = [];
-      while (i < n && bodyLines[i].charCodeAt(0) === 62) {
-        let l = bodyLines[i].slice(1);
+      while (i < n && lines[i].charCodeAt(0) === 62) {
+        let l = lines[i].slice(1);
         if (l.charCodeAt(0) === 32) l = l.slice(1);
         l = trimST(l);
         if (l !== '') parts.push(l);
@@ -826,7 +825,7 @@ function renderMarkdown(bodyLines) {
       const firstNum = marker.num;
       i++;
       while (i < n) {
-        const l = bodyLines[i];
+        const l = lines[i];
         const m = parseListMarker(l);
         if (m !== null && m.kind === kind) { items.push(m.text); i++; continue; }
         // Continuation: two or more spaces/tabs, then a non-space.
@@ -854,7 +853,7 @@ function renderMarkdown(bodyLines) {
     const pLines = [trimST(line)];
     i++;
     while (i < n) {
-      const l = bodyLines[i];
+      const l = lines[i];
       if (isBlankLine(l)) break;
       if (parseFenceOpen(l) !== null) break;
       if (headingInfo(l) !== null) break;
@@ -947,7 +946,7 @@ export function run(input) {
     if (fm.draft === true) { reportLines.push('draft ' + src.path); continue; }
     pages.push({
       path: src.path, fm, isPost, layout,
-      bodyLines: lines.slice(res.bodyStart),
+      lines, bodyStart: res.bodyStart,
       dir: isPost ? 'posts' : dirOf(src.path),
     });
   }
@@ -975,11 +974,11 @@ export function run(input) {
     const p = pages[i];
     LINK_SRC = p.path;
     LINK_DIR = dirOf(p.path);
-    const md = renderMarkdown(p.bodyLines);
+    const md = renderMarkdown(p.lines, p.bodyStart);
     p.content = md.html;
     p.toc = md.toc;
     p.excerpt = md.excerpt;
-    p.readingMinutes = Math.max(1, Math.ceil(countWords(p.bodyLines) / 200));
+    p.readingMinutes = Math.max(1, Math.ceil(countWords(p.lines, p.bodyStart) / 200));
   }
 
   // 6. Collections: posts, newest date first, equal dates by slug.
